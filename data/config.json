@@ -5,9 +5,7 @@
   "use_meteoswiss": true,
   "mch_station": "",
   "news_feeds": [
-    "https://www.tagesschau.de/index~rss2.xml",
-    "https://www.spiegel.de/schlagzeilen/index.rss",
-    "https://feeds.reuters.com/reuters/WorldNews"
+    "https://www.srf.ch/news/bnf/rss/1646"
   ]
 }
 

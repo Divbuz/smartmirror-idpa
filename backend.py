@@ -1,56 +1,72 @@
 # backend.py
-import os, threading, math, csv
+import os
+import csv
+import math
+import json
+import threading
+import requests
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
-import json, requests
 
+# Qt
 from PySide6.QtCore import QObject, Signal, Slot, QTimer, QDateTime, QLocale
 
-# Optionale Pakete (robust importieren)
+# --- Konfiguration ---
+# Hier den Link reinpacken (nicht in public repos pushen!)
+ICAL_URL_FIXED = "" 
+
+# Libs importieren, aber nicht crashen wenn sie fehlen
 try:
     import feedparser
-except Exception:
+except ImportError:
     feedparser = None
 
 try:
     from ics import Calendar
-except Exception:
+except ImportError:
     Calendar = None
 
 
-# ───────────────────────────── MeteoSwiss Open Data (SwissMetNet) ─────────────────────────────
+# --- MeteoSwiss Konstanten & Helper ---
 MCH_BASE = "https://data.geo.admin.ch"
 MCH_COLLECTION = "ch.meteoschweiz.ogd-smn"
 MCH_STATIONS_CSV = f"{MCH_BASE}/{MCH_COLLECTION}/ogd-smn_meta_stations.csv"
 
 def load_config():
-    """Lädt /data/config.json, liefert Defaults wenn nicht vorhanden."""
+    # Versucht config.json zu laden, sonst hardcoded defaults
     here = os.path.dirname(__file__)
-    p = os.path.join(here, "data", "config.json")
-    if os.path.exists(p):
+    path = os.path.join(here, "data", "config.json")
+    if os.path.exists(path):
         try:
-            with open(p, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            pass
-    # sinnvolle Defaults
+            pass # Datei kaputt oder leer? Egal, weiter mit Defaults.
+    
     return {
-        "lat": 47.3769,
+        "lat": 47.3769,  # Zürich
         "lon": 8.5417,
-        "ics_url": "",
+        "ics_url": ICAL_URL_FIXED,
         "use_meteoswiss": True,
         "mch_station": "",
-        "news_feeds": ["https://www.tagesschau.de/index~rss2.xml"]
+        "news_feeds": [
+            "https://www.tagesschau.de/index~rss2.xml",
+            "https://feeds.bbci.co.uk/news/rss.xml"
+        ]
     }
 
 def csv_get(url, timeout=10):
-    """Liest Semikolon/CP1252-CSV von MeteoSwiss als Dict-Liste."""
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "SmartMirror/1.0"})
-    r.raise_for_status()
-    text = r.content.decode("cp1252", errors="replace")
-    return list(csv.DictReader(text.splitlines(), delimiter=';'))
+    # MeteoSwiss liefert CP1252 codierte CSVs mit Semikolon
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "SmartMirror/1.0"})
+        r.raise_for_status()
+        text = r.content.decode("cp1252", errors="replace")
+        return list(csv.DictReader(text.splitlines(), delimiter=";"))
+    except Exception as e:
+        print(f"CSV Error ({url}): {e}")
+        return []
 
 def haversine(lat1, lon1, lat2, lon2):
+    # Abstand zwischen zwei Koordinaten berechnen
     R = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -62,462 +78,370 @@ def nearest_station(lat, lon, stations):
     best = None
     for r in stations:
         try:
+            # Daten parsen, manchmal sind Felder leer/nan
             s_lat = float(r.get("Latitude", r.get("latitude", "nan")))
             s_lon = float(r.get("Longitude", r.get("longitude", "nan")))
-            code  = (r.get("Abbr") or r.get("abbr","")).strip()
-            name  = (r.get("Name") or r.get("name", code)).strip()
-            if not code or math.isnan(s_lat) or math.isnan(s_lon):
-                continue
-            d = haversine(lat, lon, s_lat, s_lon)
-            if best is None or d < best[0]:
-                best = (d, code, name)
-        except Exception:
-            pass
-    return best  # (dist_m, CODE, Name)
+            code = (r.get("Abbr") or r.get("abbr", "")).strip()
+            name = (r.get("Name") or r.get("name", code)).strip()
+            
+            if not code or math.isnan(s_lat) or math.isnan(s_lon): continue
+            
+            dist = haversine(lat, lon, s_lat, s_lon)
+            if best is None or dist < best[0]:
+                best = (dist, code, name)
+        except Exception: pass
+    return best
 
 def build_station_file_url(station_code, granularity="t", period="now"):
-    """z.B. .../ch.meteoschweiz.ogd-smn/now/t/ogd-smn_zur_t_now.csv"""
     code = station_code.lower()
     return f"{MCH_BASE}/{MCH_COLLECTION}/{period}/{granularity}/ogd-smn_{code}_{granularity}_{period}.csv"
 
 def parse_latest_rows(rows, n=6):
+    # Nur Zeilen mit Inhalt nehmen
     valid = [r for r in rows if r and any((v or "").strip() for v in r.values())]
     return valid[-n:] if valid else []
 
 def _to_float(v):
-    try:
-        return float(str(v).replace(",", "."))
-    except Exception:
-        return None
+    try: return float(str(v).replace(",", "."))
+    except: return None
 
 def extract_fields(row):
-    """Heuristisch gängige Parameter aus SwissMetNet-CSV ziehen."""
-    temp=hum=press=wind_ms=gust_ms=wind_dir=prec_10=None
-    press_prio = None  # qff > qfe > rest
+    # Versucht, die Daten aus dem CSV Chaos zu extrahieren.
+    # Die Spaltennamen ändern sich manchmal, daher die vielen 'or' checks.
+    data = {"temp": None, "hum": None, "wind_ms": None, "gust_ms": None, "prec_10": None, "press": None, "wind_dir": None}
+    press_prio = None
+
     for k, v in row.items():
-        kl = k.lower()
-        s = (v or "").strip()
-        if not s or s in ("-", "NaN"):
-            continue
+        kl = k.lower(); s = (v or "").strip()
+        if not s or s in ("-", "NaN"): continue
         f = _to_float(s)
-        if f is None:
-            continue
-        if temp is None and ("tre200" in kl or "temp" in kl or kl.startswith("ta")):
-            temp = f
-        elif hum is None and ("ure200" in kl or "rhu" in kl or "feuchte" in kl or kl == "rh"):
-            hum = f
-        elif ("qff" in kl) or ("qfe" in kl) or ("druck" in kl) or ("press" in kl):
+        if f is None: continue
+        
+        if data["temp"] is None and ("tre200" in kl or "temp" in kl or kl.startswith("ta")): data["temp"] = f
+        elif data["hum"] is None and ("ure200" in kl or "rhu" in kl): data["hum"] = f
+        elif ("qff" in kl) or ("qfe" in kl) or ("press" in kl): # Druck Priorität: QFF > QFE
             pr = 3 if "qff" in kl else (2 if "qfe" in kl else 1)
             if press_prio is None or pr > press_prio:
-                press_prio = pr
-                press = f
-        elif wind_ms is None and ("fu3010" in kl or kl.startswith("ff") or "wind" in kl):
-            wind_ms = f
-        elif gust_ms is None and ("fx" in kl or "gust" in kl):
-            gust_ms = f
-        elif wind_dir is None and ("dkl010" in kl or kl.startswith("dd") or "dir" in kl):
-            wind_dir = f
-        elif prec_10 is None and ("rre" in kl or kl.startswith("rr") or "precip" in kl or "nied" in kl):
-            prec_10 = f
-    return dict(temp=temp, hum=hum, press=press, wind_ms=wind_ms,
-                gust_ms=gust_ms, wind_dir=wind_dir, prec_10=prec_10)
+                press_prio = pr; data["press"] = f
+        elif data["wind_ms"] is None and ("fu3010" in kl or "wind" in kl): data["wind_ms"] = f
+        elif data["gust_ms"] is None and ("fx" in kl or "gust" in kl): data["gust_ms"] = f
+        elif data["wind_dir"] is None and ("dkl010" in kl or "dir" in kl): data["wind_dir"] = f
+        elif data["prec_10"] is None and ("rre" in kl or "precip" in kl): data["prec_10"] = f
+
+    return data
 
 def deg_to_cardinal(d):
-    if d is None:
-        return None
+    if d is None: return None
     dirs = ["N","NNO","NO","ONO","O","OSO","SO","SSO","S","SSW","SW","WSW","W","WNW","NW","NNW"]
-    ix = int((d % 360) / 22.5 + 0.5) % 16
-    return dirs[ix]
+    return dirs[int((d % 360) / 22.5 + 0.5) % 16]
 
 def beaufort(w_kmh):
-    if w_kmh is None:
-        return None
+    if w_kmh is None: return None
     thresholds = [1,6,12,20,29,39,50,62,75,89,103,118,1e9]
     for i, thr in enumerate(thresholds):
-        if w_kmh <= thr:
-            return i
+        if w_kmh <= thr: return i
     return 12
 
 def windchill(temp_c, wind_kmh):
-    if temp_c is None or wind_kmh is None:
-        return None
-    if temp_c > 10 or wind_kmh < 4.8:
-        return None
+    # Formel gilt nur unter 10°C und über 5km/h Wind
+    if temp_c is None or wind_kmh is None or temp_c > 10 or wind_kmh < 4.8: return None
     v = wind_kmh
     return 13.12 + 0.6215*temp_c - 11.37*(v**0.16) + 0.3965*temp_c*(v**0.16)
 
 def fmt_utc_local(ts_str):
-    # SwissMetNet nutzt UTC 'dd.mm.yyyy HH:MM'
     try:
         dt_utc = datetime.strptime(ts_str, "%d.%m.%Y %H:%M").replace(tzinfo=timezone.utc)
         return QDateTime.fromSecsSinceEpoch(int(dt_utc.timestamp())).toString("dd.MM. HH:mm")
-    except Exception:
-        return ts_str or ""
+    except: return ts_str or ""
 
 
-# ───────────────────────────────────────── Backend ─────────────────────────────────────────
+# --- Main Class ---
 class Backend(QObject):
     # Signale für QML
-    timeChanged    = Signal(str)
-    dateChanged    = Signal(str)
-    weatherChanged = Signal(str)
-    stationChanged = Signal(str)
-    calendarChanged= Signal(str)
-    newsChanged    = Signal(str)
-    todosChanged   = Signal(str)
-    cpuChanged     = Signal(str)
-    dimChanged     = Signal(float)
-
+    timeChanged     = Signal(str)
+    dateChanged     = Signal(str)
+    weatherChanged  = Signal(str)
+    stationChanged  = Signal(str)
+    calendarChanged = Signal(str)
+    newsChanged     = Signal(str)
+    dimChanged      = Signal(float)
+    
     def __init__(self, parent=None):
         super().__init__(parent)
+        
+        # Schweizer Zeit für korrekte Wochentage/Datumsformate
         QLocale.setDefault(QLocale(QLocale.German, QLocale.Switzerland))
+        
         self.cfg = load_config()
         self.lat = float(self.cfg.get("lat", 47.3769))
         self.lon = float(self.cfg.get("lon", 8.5417))
         self.use_mch = bool(self.cfg.get("use_meteoswiss", True))
         self.mch_station_fixed = (self.cfg.get("mch_station") or "").strip().upper()
 
-        # CLOCK
+        # --- Timer Setup ---
+        
+        # Uhr (1s)
         self._clock = QTimer(self)
         self._clock.timeout.connect(self._emit_time)
         self._clock.start(1000)
         self._emit_time()
 
-        # WEATHER
+        # Wetter (10min)
         self._weather = QTimer(self)
         self._weather.timeout.connect(self.update_weather_async)
         self._weather.start(10 * 60 * 1000)
         self.update_weather_async()
 
-        # CALENDAR
+        # Kalender (15min)
         self._cal = QTimer(self)
         self._cal.timeout.connect(self.update_calendar_async)
         self._cal.start(15 * 60 * 1000)
         self.update_calendar_async()
 
-        # NEWS – Fetch & Rotation
+        # News Fetch (30min) & Rotate (20s)
         self.news_items = []
         self.news_idx = 0
-
         self._news_fetch = QTimer(self)
         self._news_fetch.timeout.connect(self.update_news_async)
-        self._news_fetch.start(30 * 60 * 1000)   # alle 30 min neu laden
-        self.update_news_async()                  # sofort laden
+        self._news_fetch.start(30 * 60 * 1000)
+        self.update_news_async()
 
         self._news_rotate = QTimer(self)
         self._news_rotate.timeout.connect(self.rotate_news)
-        self._news_rotate.start(20 * 1000)       # alle 20 s nächste Headline
+        self._news_rotate.start(20 * 1000)
 
-        # TODOS
-        self._todos = QTimer(self)
-        self._todos.timeout.connect(self.update_todos)
-        self._todos.start(30 * 1000)
-        self.update_todos()
-
-        # CPU
-        self._cpu = QTimer(self)
-        self._cpu.timeout.connect(self.update_cpu)
-        self._cpu.start(10 * 1000)
-        self.update_cpu()
-
-        # DIMMING
+        # Dimm-Check (5min)
         self._dim = QTimer(self)
         self._dim.timeout.connect(self.update_dimming)
         self._dim.start(5 * 60 * 1000)
         self.update_dimming()
 
-    # ───────── CLOCK ─────────
     def _emit_time(self):
         now = QDateTime.currentDateTime()
         self.timeChanged.emit(now.toString("HH:mm:ss"))
         self.dateChanged.emit(now.toString("dddd, dd. MMMM yyyy"))
 
-    # ───────── WEATHER ─────────
+    # --- Wetter ---
     @Slot()
     def update_weather_async(self):
+        # API Calls im Thread, sonst ruckelt die UI
         threading.Thread(target=self._fetch_weather, daemon=True).start()
 
     def _fetch_weather(self):
+        # 1. MeteoSwiss Hauptquelle
         if self.use_mch:
             try:
-                # 1) Station bestimmen
                 stations = csv_get(MCH_STATIONS_CSV)
                 code = name = None
+                
+                # Check ob fixe Station in Config
                 if self.mch_station_fixed:
                     for r in stations:
-                        if (r.get("Abbr") or r.get("abbr","")).strip().upper() == self.mch_station_fixed:
+                        if (r.get("Abbr") or "").strip().upper() == self.mch_station_fixed:
                             code = self.mch_station_fixed
-                            name = (r.get("Name") or r.get("name") or code).strip()
+                            name = (r.get("Name") or code).strip()
                             break
+                
+                # Sonst nächste suchen
                 if not code:
                     best = nearest_station(self.lat, self.lon, stations)
-                    if not best:
-                        raise RuntimeError("Keine Station gefunden")
+                    if not best: raise RuntimeError("Keine Station gefunden")
                     _, code, name = best
+                
                 self.stationChanged.emit(f"{name} ({code})")
 
-                # 2) 10-Minuten CSV holen (aktuell)
+                # Daten holen
                 url = build_station_file_url(code, "t", "now")
                 rows = csv_get(url, timeout=8)
                 last6 = parse_latest_rows(rows, n=6)
-                if not last6:
-                    raise RuntimeError("Keine Messwerte")
+                
+                if not last6: raise RuntimeError("CSV leer")
 
                 last = last6[-1]
-                ts   = last.get("ReferenceTS") or last.get("ref_ts") or ""
-                when = fmt_utc_local(ts)
+                when = fmt_utc_local(last.get("ReferenceTS"))
                 flds = extract_fields(last)
 
-                # Regen 1h aus den letzten 6 Zeilen sum
-                rain_1h = 0.0; have_rain = False
+                # Regen akkumulieren (letzte 60min)
+                rain_1h = 0.0
+                have_rain = False
                 for r in last6:
                     ff = extract_fields(r)
                     if ff["prec_10"] is not None:
                         rain_1h += max(0.0, ff["prec_10"])
                         have_rain = True
-                rain_10 = flds["prec_10"] if flds["prec_10"] is not None else None
+                
+                # Berechnungen für Anzeige
+                wind_kmh = flds["wind_ms"] * 3.6 if flds["wind_ms"] else None
+                gust_kmh = flds["gust_ms"] * 3.6 if flds["gust_ms"] else None
+                bft = beaufort(wind_kmh)
+                felt = round(windchill(flds["temp"], wind_kmh)) if windchill(flds["temp"], wind_kmh) else None
 
-                # Ableitungen
-                wind_kmh = flds["wind_ms"]*3.6 if flds["wind_ms"] is not None else None
-                gust_kmh = flds["gust_ms"]*3.6 if flds["gust_ms"] is not None else None
-                bft  = beaufort(wind_kmh) if wind_kmh is not None else None
-                card = deg_to_cardinal(flds["wind_dir"])
-                chill = windchill(flds["temp"], wind_kmh)
-                felt = round(chill) if (chill is not None and abs(chill - flds["temp"]) >= 1) else None
+                # Text zusammenbauen
+                lines = []
+                
+                # Zeile 1: Temp
+                l1 = f"{flds['temp']:.0f}°C" if flds["temp"] is not None else ""
+                if felt: l1 += f" (gefühlt {felt:.0f}°C)"
+                if flds["hum"]: l1 += f" · LF {flds['hum']:.0f}%"
+                if l1: lines.append(l1)
 
-                # Anzeige
-                line1 = []
-                if flds["temp"] is not None:
-                    line1.append(f"{flds['temp']:.0f}°C")
-                    if felt is not None:
-                        line1.append(f"gefühlt {felt:.0f}°C")
-                if flds["hum"] is not None:
-                    line1.append(f"LF {flds['hum']:.0f}%")
-                line1 = " · ".join(line1) if line1 else "—"
+                # Zeile 2: Wind
+                l2 = ""
+                if wind_kmh: l2 += f"Wind {wind_kmh:.0f} km/h"
+                if bft: l2 += f" ({bft} Bft)"
+                if gust_kmh: l2 += f" · Böen {gust_kmh:.0f}"
+                if l2: lines.append(l2)
 
-                line2 = []
-                if wind_kmh is not None:
-                    base = f"Wind {wind_kmh:.0f} km/h"
-                    if bft is not None:
-                        base += f" ({bft} Bft)"
-                    if card:
-                        base += f" {card}"
-                    line2.append(base)
-                if gust_kmh is not None:
-                    line2.append(f"Böen {gust_kmh:.0f} km/h")
-                line2 = " · ".join(line2)
+                # Zeile 3: Regen
+                if have_rain or (flds["prec_10"] and flds["prec_10"] > 0):
+                    lines.append(f"Regen 1h: {rain_1h:.1f} mm")
+                
+                # Zeile 4: Update Zeit
+                if when: lines.append(when)
 
-                line3 = ""
-                if have_rain or (rain_10 and rain_10 > 0):
-                    parts = []
-                    if rain_10 is not None:
-                        parts.append(f"Regen {rain_10:.1f} mm / 10 min")
-                    parts.append(f"∑1 h {rain_1h:.1f} mm")
-                    line3 = " · ".join(parts)
+                self.weatherChanged.emit("\n".join(lines) if lines else "Wetter: –")
+                return # Erfolg -> Raus hier
+            
+            except Exception as e:
+                print(f"MeteoSwiss Fail: {e}")
+                # Fallback läuft weiter unten
 
-                line4 = []
-                if flds["press"] is not None:
-                    line4.append(f"Druck {flds['press']:.0f} hPa")
-                if when:
-                    line4.append(when)
-                line4 = " · ".join(line4)
-
-                msg = "\n".join([s for s in (line1, line2, line3, line4) if s])
-                self.weatherChanged.emit(msg if msg else "Wetter: –")
-                return
-            except Exception:
-                # Fallback – unten Open-Meteo
-                pass
-
-        # Fallback: Open-Meteo (kompakt, JSON)
+        # 2. Open-Meteo Fallback
         try:
             params = {
-                "latitude": self.lat,
-                "longitude": self.lon,
-                "current_weather": True,
-                "hourly": "relativehumidity_2m,surface_pressure,precipitation",
-                "timezone": "auto"
+                "latitude": self.lat, "longitude": self.lon,
+                "current_weather": True, "timezone": "auto"
             }
-            r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=8)
-            r.raise_for_status()
-            j = r.json()
-            cw = j.get("current_weather", {})
-            temp = cw.get("temperature"); wind = cw.get("windspeed"); wd = cw.get("winddirection")
-            hum = press = rain_1h = None
-            try:
-                t_now = cw.get("time")
-                idx = j["hourly"]["time"].index(t_now) if t_now in j["hourly"]["time"] else -1
-                if idx >= 0:
-                    hum = j["hourly"]["relativehumidity_2m"][idx]
-                    press = j["hourly"]["surface_pressure"][idx]
-                    rain_1h = j["hourly"]["precipitation"][idx]
-            except Exception:
-                pass
-            card = deg_to_cardinal(wd) if wd is not None else None
-            bft = beaufort(wind) if wind is not None else None
-
-            line1 = " · ".join([s for s in (
-                f"{temp:.0f}°C" if temp is not None else "",
-                f"LF {hum:.0f}%" if hum is not None else ""
-            ) if s])
-            line2 = ""
-            if wind is not None:
-                line2 = f"Wind {wind:.0f} km/h"
-                if bft is not None: line2 += f" ({bft} Bft)"
-                if card: line2 += f" {card}"
-            line3 = f"∑1 h {rain_1h:.1f} mm" if isinstance(rain_1h, (int, float)) else ""
+            r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=5)
+            cw = r.json().get("current_weather", {})
+            
             self.stationChanged.emit("Open-Meteo")
-            self.weatherChanged.emit("\n".join([s for s in (line1, line2, line3) if s]) or "Wetter: –")
-        except Exception:
-            self.weatherChanged.emit("Wetter: offline")
+            txt = f"{cw.get('temperature')}°C · Wind {cw.get('windspeed')} km/h"
+            self.weatherChanged.emit(txt)
+        except:
+            self.weatherChanged.emit("Wetter: Offline")
 
-    # ───────── CALENDAR ─────────
+    # --- Kalender ---
     @Slot()
     def update_calendar_async(self):
         threading.Thread(target=self._fetch_calendar, daemon=True).start()
 
     def _fetch_calendar(self):
-        ics_url = self.cfg.get("ics_url", "")
-        if not ics_url:
-            self.calendarChanged.emit("Kalender: –")
+        # Link holen
+        url = self.cfg.get("ics_url") or ICAL_URL_FIXED
+        
+        if not url:
+            self.calendarChanged.emit("Kalender: Link fehlt")
             return
+        
         if Calendar is None:
-            self.calendarChanged.emit("Kalender: Modul 'ics' fehlt")
+            self.calendarChanged.emit("Modul 'ics' fehlt")
             return
+
         try:
-            r = requests.get(ics_url, timeout=8)
+            r = requests.get(url, timeout=10)
             r.raise_for_status()
             cal = Calendar(r.text)
 
             now = datetime.now().astimezone()
             horizon = now + timedelta(days=14)
-            nxt = None
+            events = []
 
             for ev in cal.events:
-                try:
-                    start = ev.begin.to('local').naive.replace(tzinfo=None)
-                except Exception:
-                    start = getattr(ev.begin, "datetime", None)
-                if not start:
-                    continue
-                if start >= now.replace(tzinfo=None) and start <= horizon.replace(tzinfo=None):
-                    if nxt is None or start < nxt[0]:
-                        try:
-                            end = ev.end.to('local').naive.replace(tzinfo=None)
-                        except Exception:
-                            end = getattr(ev, "end", None)
-                            end = getattr(end, "datetime", end)
-                        nxt = (start, end, (ev.name or "Termin"))
+                # Startzeit robust ermitteln
+                try: start = ev.begin.to('local').datetime
+                except: start = getattr(ev.begin, "datetime", None)
+                
+                if not start: continue
+                
+                # Nur Zukunft (max 14 Tage)
+                if start > (now - timedelta(hours=6)) and start < horizon:
+                    all_day = getattr(ev, "all_day", False)
+                    # Hack: Wenn keine Uhrzeit da ist, ist es ganztägig
+                    if not hasattr(start, 'hour'):
+                        all_day = True
+                        start = start.replace(hour=0, minute=0, second=0, tzinfo=now.tzinfo)
 
-            if not nxt:
-                self.calendarChanged.emit("Kalender: keine Termine")
+                    events.append((start, ev.name, all_day))
+
+            # Sortieren
+            events.sort(key=lambda x: x[0])
+
+            if not events:
+                self.calendarChanged.emit("Keine Termine")
                 return
 
-            start, end, title = nxt
-            day  = QDateTime.fromSecsSinceEpoch(int(start.timestamp())).toString("ddd, dd.MM.")
-            span = QDateTime.fromSecsSinceEpoch(int(start.timestamp())).toString("HH:mm")
-            if end:
-                span += "–" + QDateTime.fromSecsSinceEpoch(int(end.timestamp())).toString("HH:mm")
-            self.calendarChanged.emit(f"{title} · {day} {span}")
-        except Exception:
-            self.calendarChanged.emit("Kalender: offline")
+            # Liste bauen (max 6)
+            lines = []
+            for dt, title, all_day in events[:6]:
+                if dt.date() == now.date(): d_str = "Heute"
+                elif dt.date() == (now + timedelta(days=1)).date(): d_str = "Morgen"
+                else: d_str = dt.strftime("%d.%m.")
+                
+                if all_day:
+                    lines.append(f"• {d_str} : {title}")
+                else:
+                    lines.append(f"• {d_str} {dt.strftime('%H:%M')} : {title}")
 
-    # ───────── NEWS (mehrere Feeds + Rotation) ─────────
+            self.calendarChanged.emit("\n".join(lines))
+
+        except Exception as e:
+            print(f"Kalender Error: {e}")
+            self.calendarChanged.emit("Kalender: Offline")
+
+    # --- News ---
     @Slot()
     def rotate_news(self):
-        if not self.news_items:
-            return
+        if not self.news_items: return
         self.news_idx = (self.news_idx + 1) % len(self.news_items)
-        title, source = self.news_items[self.news_idx]
-        self.newsChanged.emit(f"{title}  ·  {source}" if source else title)
+        t, s = self.news_items[self.news_idx]
+        self.newsChanged.emit(f"{t}  ·  {s}" if s else t)
 
     @Slot()
     def update_news_async(self):
         threading.Thread(target=self._fetch_news, daemon=True).start()
 
     def _fetch_news(self):
-        feeds = self.cfg.get("news_feeds")
-        if not (feeds and isinstance(feeds, list)):
-            # Fallback auf einzelnes news_rss
-            u = self.cfg.get("news_rss", "")
-            feeds = [u] if u else []
-
+        feeds = self.cfg.get("news_feeds", [])
         if feedparser is None:
-            self.news_items = []
-            self.newsChanged.emit("News: Modul 'feedparser' fehlt")
-            return
+            self.newsChanged.emit("Modul 'feedparser' fehlt"); return
 
         items = []
         seen = set()
+
         for u in feeds:
-            if not u:
-                continue
+            if not u: continue
             try:
                 resp = requests.get(u, timeout=8, headers={"User-Agent": "SmartMirror/1.0"})
-                resp.raise_for_status()
                 fd = feedparser.parse(resp.content)
+                src = (fd.feed.title or "").strip()
 
-                source = ""
-                try:
-                    source = (fd.feed.title or "").strip()
-                except Exception:
-                    pass
-
-                for e in fd.entries[:8]:  # pro Feed max. 8 Headlines
+                for e in fd.entries[:5]: # Max 5 pro Feed
                     title = (getattr(e, "title", "") or "").strip()
-                    if not title:
-                        continue
-                    key = (title, source)
-                    if key in seen:
-                        continue
+                    if not title: continue
+                    
+                    # Doppelte filtern
+                    key = (title, src)
+                    if key in seen: continue
                     seen.add(key)
-                    # Optional: zu lange Titel kürzen
-                    if len(title) > 180:
-                        title = title[:177] + "…"
-                    items.append((title, source))
-            except Exception:
-                continue
+                    
+                    if len(title) > 180: title = title[:177] + "…"
+                    items.append((title, src))
+            except: continue
 
-        if not items:
-            self.news_items = []
-            self.newsChanged.emit("News: keine Einträge")
-            return
+        if items:
+            self.news_items = items
+            self.news_idx = 0
+            t, s = items[0]
+            self.newsChanged.emit(f"{t}  ·  {s}" if s else t)
+        else:
+            self.newsChanged.emit("Keine Nachrichten")
 
-        self.news_items = items
-        self.news_idx = 0
-        t, s = items[0]
-        self.newsChanged.emit(f"{t}  ·  {s}" if s else t)
-
-    # ───────── TODOS ─────────
-    @Slot()
-    def update_todos(self):
-        here = os.path.dirname(__file__)
-        p = os.path.join(here, "data", "todos.json")
-        if not os.path.exists(p):
-            self.todosChanged.emit("To-Dos: (keine)")
-            return
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            items = [t for t in data if not t.get("done")]
-            if not items:
-                self.todosChanged.emit("Alles erledigt ✅")
-                return
-            self.todosChanged.emit("\n".join([f"• {t.get('title','(ohne Titel)')}" for t in items[:3]]))
-        except Exception:
-            self.todosChanged.emit("To-Dos: Fehler")
-
-    # ───────── CPU ─────────
-    @Slot()
-    def update_cpu(self):
-        try:
-            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-                milli = int(f.read().strip())
-            self.cpuChanged.emit(f"CPU {milli/1000:.0f}°C")
-        except Exception:
-            self.cpuChanged.emit("CPU –")
-
-    # ───────── DIMMING ─────────
+    # --- Dimmung ---
     def update_dimming(self):
         h = QDateTime.currentDateTime().time().hour()
-        self.dimChanged.emit(0.4 if (h >= 22 or h < 6) else 1.0)
+        # Nachts abdunkeln
+        if h >= 22 or h < 6:
+            self.dimChanged.emit(0.4)
+        else:
+            self.dimChanged.emit(1.0)

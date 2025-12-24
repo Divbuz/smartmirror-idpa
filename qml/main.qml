@@ -10,12 +10,12 @@ Window {
     color: "black"
     flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
 
-    // Nacht-Dimmung
+    // nachts abdunkeln
     property real dimmer: 1.0
     opacity: dimmer
     Behavior on opacity { NumberAnimation { duration: 400 } }
 
-    // ───────── Zentrum: Uhr & Datum ─────────
+    // uhr und datum mitte
     Column {
         anchors.centerIn: parent
         spacing: 12
@@ -39,7 +39,7 @@ Window {
         }
     }
 
-    // ───────── Links oben: Wetter + Station (OHNE CPU) ─────────
+    // wetter links oben
     Column {
         anchors.left: parent.left
         anchors.top: parent.top
@@ -48,10 +48,10 @@ Window {
 
         Text {
             id: weatherTxt
-            text: "Wetter …"
+            text: "Wetter..."
             width: 640
             wrapMode: Text.Wrap
-            font.pixelSize: 46  // Etwas größer für bessere Lesbarkeit
+            font.pixelSize: 46
             font.family: "DejaVu Sans"
             color: "#AFAFAF"
         }
@@ -64,7 +64,8 @@ Window {
         }
     }
 
-    // ───────── Rechts oben: Kalender ─────────
+    // kalender rechts oben
+    // zeigt automatisch mehrere termine, wenn backend zeilenumbrüche sendet
     Rectangle {
         anchors.right: parent.right
         anchors.top: parent.top
@@ -75,9 +76,9 @@ Window {
 
         Text {
             id: calTxt
-            text: "Lade Kalender..."
+            text: "Kalender lädt..."
             width: parent.width
-            wrapMode: Text.Wrap
+            wrapMode: Text.Wrap // wichtig für mehrzeilige liste
             font.pixelSize: 28
             font.family: "DejaVu Sans"
             color: "#AFAFAF"
@@ -85,7 +86,7 @@ Window {
         }
     }
 
-    // ───────── Unten: NEWS-TICKER (Dein verbesserter Code) ─────────
+    // news ticker unten
     Rectangle {
         id: newsBar
         anchors.left: parent.left
@@ -98,15 +99,13 @@ Window {
 
         color: "transparent"
 
-        // Hintergrund
+        // hintergrund leicht dunkel
         Rectangle { anchors.fill: parent; color: "#000"; opacity: 0.18 }
 
+        // clipping damit text nicht rausläuft
         Item {
             id: clipper
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
+            anchors.fill: parent
             anchors.leftMargin: 24
             anchors.rightMargin: 24
             anchors.topMargin: newsBar.vpad
@@ -115,7 +114,7 @@ Window {
 
             Text {
                 id: newsText
-                text: "Lade Nachrichten..."
+                text: ""
                 anchors.verticalCenter: parent.verticalCenter
                 x: 0
                 font.pixelSize: newsBar.fontPx
@@ -123,11 +122,10 @@ Window {
                 renderType: Text.NativeRendering
                 color: "#E0E0E0"
                 opacity: 1.0
-                elide: Text.ElideNone
             }
         }
 
-        // Marquee-Animation
+        // laufschrift animation
         NumberAnimation {
             id: marquee
             target: newsText
@@ -137,10 +135,11 @@ Window {
             running: false
         }
 
-        // Animationen
+        // fade effekte beim wechsel
         PropertyAnimation { id: fadeOut; target: newsText; property: "opacity"; from: 1.0; to: 0.0; duration: 220; running: false }
         PropertyAnimation { id: fadeIn;  target: newsText; property: "opacity"; from: 0.0; to: 1.0; duration: 240; running: false }
 
+        // logik für den textwechsel
         Timer {
             id: measureTimer
             interval: 50
@@ -156,15 +155,18 @@ Window {
             interval: 700
             repeat: false
             onTriggered: {
+                // wenn text zu lang -> scrollen
                 if (newsText.paintedWidth > clipper.width) {
                     newsText.x = clipper.width
                     var dist = newsText.paintedWidth + clipper.width
-                    var pxPerSec = 120
+                    // speed: pixel pro sekunde
+                    var pxPerSec = 120 
                     marquee.from = clipper.width
                     marquee.to = -newsText.paintedWidth
                     marquee.duration = Math.max(4000, (dist / pxPerSec) * 1000)
                     marquee.running = true
                 } else {
+                    // sonst zentrieren
                     newsText.x = Math.floor((clipper.width - newsText.paintedWidth) / 2)
                 }
                 fadeIn.restart()
@@ -172,23 +174,26 @@ Window {
         }
 
         property string pendingNews: ""
+        
         function setNewsSmooth(s) {
             pendingNews = s
             marquee.stop()
             if (newsText.opacity > 0.05) fadeOut.restart()
             else applyPending()
         }
+        
         function applyPending() {
             newsText.text = pendingNews
             measureTimer.restart()
         }
+        
         Connections {
             target: fadeOut
             function onStopped() { newsBar.applyPending() }
         }
     }
 
-    // ───────── Backend-Verbindung ─────────
+    // verbindung zum python backend
     Connections {
         target: backend
         
@@ -197,10 +202,12 @@ Window {
         function onWeatherChanged(s)   { weatherTxt.text = s }
         function onStationChanged(s)   { stationTxt.text = s }
         
-        // CPU wurde hier entfernt!
-        
+        // kalender liste kommt hier als string mit zeilenumbrüchen rein
         function onCalendarChanged(s)  { calTxt.text = s }
+        
+        // news wechseln durch rotation im backend
         function onNewsChanged(s)      { newsBar.setNewsSmooth(s) }
+        
         function onDimChanged(v)       { win.dimmer = v }
     }
 }
